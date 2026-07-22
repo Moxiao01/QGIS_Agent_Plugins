@@ -1,19 +1,20 @@
 [general]
 name=QGIS Agent
 qgisMinimumVersion=3.16
-description=智能地理分析助手，通过自然语言驱动QGIS空间分析
-version=1.0.0
-author=QGISAgent Team
-email=agent@qgis.example.com
-about=QGIS Agent 是一个基于大语言模型的智能地理分析插件，支持自然语言输入、空间分析、数据加载可视化、地图输出与报告生成。
+qgisMaximumVersion=3.99
+description=通过自然语言和大语言模型驱动 QGIS 数据加载、空间分析与地图输出
+version=1.1.0
+author=Moxiao01
+email=
+about=QGIS Agent 是一个支持 OpenAI 兼容接口、Anthropic 与 Ollama 的智能地理分析插件，提供 17 个内置工具、多轮工具调用、执行日志和代码确认机制。
 
-tracker=https://github.com/yourname/qgis-agent/issues
-repository=https://github.com/yourname/qgis-agent
+tracker=https://github.com/Moxiao01/QGIS_Agent_Plugins/issues
+repository=https://github.com/Moxiao01/QGIS_Agent_Plugins
+homepage=https://github.com/Moxiao01/QGIS_Agent_Plugins
 
-tags=ai,agent,llm,spatial analysis,automation
-homepage=https://github.com/yourname/qgis-agent
+tags=ai,agent,llm,gis,spatial analysis,automation
 category=Plugins
-icon=icon.png
+icon=icon.svg
 experimental=False
 deprecated=False
 server=False

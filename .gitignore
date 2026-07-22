@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+*.zip
+.pytest_cache/
+.coverage
+htmlcov/
+.vscode/
+.idea/
+qgis_probe_tmp.py

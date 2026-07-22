@@ -2,10 +2,11 @@
 """
 QGIS Agent 设置对话框
 """
+from dataclasses import asdict
 from qgis.PyQt.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox,
-    QPushButton, QLabel, QGroupBox, QCheckBox,
+    QPushButton, QLabel, QCheckBox,
     QFileDialog, QMessageBox, QTabWidget, QWidget,
 )
 from qgis.PyQt.QtCore import Qt
@@ -18,6 +19,9 @@ class SettingsDialog(QDialog):
     def __init__(self, config: AgentConfig, parent=None):
         super().__init__(parent)
         self.config = config
+        self._original_values = {
+            key: value for key, value in asdict(config).items() if not key.startswith("_")
+        }
         self.setWindowTitle("QGIS Agent 设置")
         self.setMinimumWidth(480)
         self._build_ui()
@@ -61,6 +65,16 @@ class SettingsDialog(QDialog):
         self.max_tokens_spin.setSingleStep(512)
         llm_form.addRow("Max Tokens:", self.max_tokens_spin)
 
+        self.timeout_spin = QSpinBox()
+        self.timeout_spin.setRange(5, 600)
+        self.timeout_spin.setSuffix(" 秒")
+        llm_form.addRow("请求超时:", self.timeout_spin)
+
+        self.retry_spin = QSpinBox()
+        self.retry_spin.setRange(0, 5)
+        self.retry_spin.setToolTip("仅重试 429、5xx、连接失败和超时；4xx 参数错误不会重试")
+        llm_form.addRow("失败重试次数:", self.retry_spin)
+
         # 快速配置提示
         hint = QLabel(
             "<b>常用配置示例：</b><br>"
@@ -84,8 +98,21 @@ class SettingsDialog(QDialog):
         self.max_iter_spin.setRange(1, 50)
         agent_form.addRow("最大推理轮次:", self.max_iter_spin)
 
-        self.auto_exec_check = QCheckBox("自动执行代码（不询问）")
-        agent_form.addRow("代码执行:", self.auto_exec_check)
+        self.tool_timeout_spin = QSpinBox()
+        self.tool_timeout_spin.setRange(5, 3600)
+        self.tool_timeout_spin.setSuffix(" 秒")
+        agent_form.addRow("工具等待超时:", self.tool_timeout_spin)
+
+        self.python_tool_check = QCheckBox("启用自定义 Python 工具（高风险）")
+        self.python_tool_check.toggled.connect(self._on_python_tool_toggled)
+        agent_form.addRow("Python 工具:", self.python_tool_check)
+
+        self.auto_exec_check = QCheckBox("自动执行 Python（不询问，极高风险）")
+        self.auto_exec_check.clicked.connect(self._on_auto_execute_clicked)
+        agent_form.addRow("Python 授权:", self.auto_exec_check)
+
+        self.processing_tool_check = QCheckBox("启用通用 Processing 白名单工具")
+        agent_form.addRow("Processing:", self.processing_tool_check)
 
         self.memory_check = QCheckBox("保留对话历史")
         agent_form.addRow("记忆:", self.memory_check)
@@ -106,6 +133,16 @@ class SettingsDialog(QDialog):
         output_row.addWidget(self.output_dir_edit)
         output_row.addWidget(btn_browse)
         agent_form.addRow("输出目录:", output_row)
+
+        self.restrict_output_check = QCheckBox("仅允许写入输出目录")
+        agent_form.addRow("路径隔离:", self.restrict_output_check)
+
+        self.overwrite_check = QCheckBox("允许覆盖已有输出")
+        agent_form.addRow("覆盖策略:", self.overwrite_check)
+
+        self.task_logging_check = QCheckBox("保存本地 JSONL 任务日志")
+        self.task_logging_check.setToolTip("日志位于输出目录/logs，可能包含用户输入、路径和工具参数")
+        agent_form.addRow("任务日志:", self.task_logging_check)
 
         tabs.addTab(agent_widget, "Agent 配置")
 
@@ -133,12 +170,39 @@ class SettingsDialog(QDialog):
         self.model_edit.setText(self.config.llm_model)
         self.temperature_spin.setValue(self.config.llm_temperature)
         self.max_tokens_spin.setValue(self.config.llm_max_tokens)
+        self.timeout_spin.setValue(self.config.request_timeout)
+        self.retry_spin.setValue(self.config.request_retries)
         self.max_iter_spin.setValue(self.config.max_iterations)
+        self.tool_timeout_spin.setValue(self.config.tool_execution_timeout)
+        self.python_tool_check.setChecked(self.config.enable_python_tool)
         self.auto_exec_check.setChecked(self.config.enable_auto_execute)
+        self._on_python_tool_toggled(self.python_tool_check.isChecked())
+        self.processing_tool_check.setChecked(self.config.enable_generic_processing)
         self.memory_check.setChecked(self.config.enable_memory)
         self.max_history_spin.setValue(self.config.max_history)
         self.crs_edit.setText(self.config.default_crs)
         self.output_dir_edit.setText(self.config.output_dir)
+        self.restrict_output_check.setChecked(self.config.restrict_output_paths)
+        self.overwrite_check.setChecked(self.config.allow_overwrite)
+        self.task_logging_check.setChecked(self.config.enable_task_logging)
+
+    def _on_python_tool_toggled(self, enabled: bool):
+        self.auto_exec_check.setEnabled(enabled)
+        if not enabled:
+            self.auto_exec_check.setChecked(False)
+
+    def _on_auto_execute_clicked(self, checked: bool):
+        if not checked:
+            return
+        answer = QMessageBox.warning(
+            self,
+            "确认高风险设置",
+            "自动执行会跳过每次 Python 代码确认，模型生成的代码将直接在 QGIS 进程中运行。是否继续？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            self.auto_exec_check.setChecked(False)
 
     def _on_provider_changed(self, provider: str):
         is_ollama = (provider == "ollama")
@@ -171,14 +235,32 @@ class SettingsDialog(QDialog):
         self.config.llm_model = self.model_edit.text().strip()
         self.config.llm_temperature = self.temperature_spin.value()
         self.config.llm_max_tokens = self.max_tokens_spin.value()
+        self.config.request_timeout = self.timeout_spin.value()
+        self.config.request_retries = self.retry_spin.value()
         self.config.max_iterations = self.max_iter_spin.value()
+        self.config.tool_execution_timeout = self.tool_timeout_spin.value()
+        self.config.enable_python_tool = self.python_tool_check.isChecked()
         self.config.enable_auto_execute = self.auto_exec_check.isChecked()
+        self.config.enable_generic_processing = self.processing_tool_check.isChecked()
         self.config.enable_memory = self.memory_check.isChecked()
         self.config.max_history = self.max_history_spin.value()
         self.config.default_crs = self.crs_edit.text().strip()
         self.config.output_dir = self.output_dir_edit.text().strip()
+        self.config.restrict_output_paths = self.restrict_output_check.isChecked()
+        self.config.allow_overwrite = self.overwrite_check.isChecked()
+        self.config.enable_task_logging = self.task_logging_check.isChecked()
+        self.config.normalize()
 
     def _save_and_close(self):
-        self._apply_values()
-        self.config.save()
+        try:
+            self._apply_values()
+            self.config.save()
+        except (OSError, ValueError) as exc:
+            QMessageBox.critical(self, "Save failed", f"Unable to save configuration: {exc}")
+            return
         self.accept()
+
+    def reject(self):
+        for key, value in self._original_values.items():
+            setattr(self.config, key, value)
+        super().reject()

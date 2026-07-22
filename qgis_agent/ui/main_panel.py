@@ -1,89 +1,147 @@
 # -*- coding: utf-8 -*-
-"""
-QGIS Agent 主面板
-停靠式对话界面，显示推理过程和工具调用状态
-"""
+"""Dockable chat panel for QGIS Agent."""
+
 import json
+import threading
+
+from qgis.PyQt.QtCore import QObject, QThread, QTimer, Qt, pyqtSignal
+from qgis.PyQt.QtGui import QFont
 from qgis.PyQt.QtWidgets import (
-    QDockWidget, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QTextEdit, QLineEdit, QLabel,
-    QSplitter, QScrollArea, QFrame, QMessageBox,
-    QProgressBar, QTabWidget, QPlainTextEdit,
+    QDockWidget,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPlainTextEdit,
+    QProgressBar,
+    QPushButton,
+    QScrollArea,
+    QTabWidget,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
 )
-from qgis.PyQt.QtCore import Qt, QThread, pyqtSignal, QObject
-from qgis.PyQt.QtGui import QFont, QColor, QTextCursor
 
 from ..core.agent import QGISAgent
-from ..core.config import AgentConfig
 from .settings_dialog import SettingsDialog
 
 
-# ------------------------------------------------------------------ #
-#  后台线程：避免UI阻塞                                               #
-# ------------------------------------------------------------------ #
+class MainThreadRequest:
+    """Blocking request used to marshal QGIS and dialog calls to the GUI thread."""
+
+    def __init__(self, **payload):
+        self.payload = payload
+        self.done = threading.Event()
+        self.result = None
+        self.error = None
+        self.cancelled = False
+
+
 class AgentWorker(QObject):
-    """在后台线程运行Agent推理"""
+    """Run network-bound LLM reasoning without calling QGIS from this thread."""
+
     finished = pyqtSignal(str)
     thinking = pyqtSignal(str)
-    tool_called = pyqtSignal(str, str)   # name, args_json
-    tool_result = pyqtSignal(str, str)   # name, result
+    tool_called = pyqtSignal(str, str)
+    tool_result = pyqtSignal(str, str)
     error = pyqtSignal(str)
+    execute_requested = pyqtSignal(object)
+    confirm_requested = pyqtSignal(object)
 
     def __init__(self, agent: QGISAgent, user_input: str):
         super().__init__()
         self.agent = agent
         self.user_input = user_input
+        self._had_error = False
+
+    def _execute_on_main_thread(self, name, args, fn):
+        request = MainThreadRequest(name=name, args=args, fn=fn)
+        self.execute_requested.emit(request)
+        timeout = max(5, int(self.agent.config.tool_execution_timeout))
+        if not request.done.wait(timeout):
+            request.cancelled = True
+            raise TimeoutError(f"工具 {name} 等待主线程超过 {timeout} 秒")
+        if request.error:
+            raise request.error
+        return request.result
+
+    def _confirm_on_main_thread(self, code):
+        request = MainThreadRequest(code=code)
+        self.confirm_requested.emit(request)
+        timeout = max(5, int(self.agent.config.tool_execution_timeout))
+        if not request.done.wait(timeout):
+            request.cancelled = True
+            return False
+        return bool(request.result)
+
+    def _emit_error(self, message):
+        self._had_error = True
+        self.error.emit(message)
 
     def run(self):
-        self.agent.on_thinking(lambda msg: self.thinking.emit(msg))
-        self.agent.on_tool_call(lambda n, a: self.tool_called.emit(n, json.dumps(a, ensure_ascii=False)))
-        self.agent.on_tool_result(lambda n, r: self.tool_result.emit(n, r))
-        self.agent.on_response(lambda r: self.finished.emit(r))
-        self.agent.on_error(lambda e: self.error.emit(e))
-        self.agent.chat(self.user_input)
+        self.agent.on_thinking(lambda message: self.thinking.emit(message))
+        self.agent.on_tool_call(
+            lambda name, args: self.tool_called.emit(
+                name, json.dumps(args, ensure_ascii=False, default=str)
+            )
+        )
+        self.agent.on_tool_result(lambda name, result: self.tool_result.emit(name, result))
+        self.agent.on_response(None)
+        self.agent.on_error(self._emit_error)
+        self.agent.set_tool_executor(self._execute_on_main_thread)
+        self.agent.set_confirm_execute(self._confirm_on_main_thread)
+        try:
+            response = self.agent.chat(self.user_input)
+            if not self._had_error:
+                self.finished.emit(response)
+        except Exception as exc:
+            self._emit_error(f"Agent 运行异常: {exc}")
+        finally:
+            self.agent.set_tool_executor(None)
+            self.agent.set_confirm_execute(None)
 
 
-# ------------------------------------------------------------------ #
-#  消息气泡组件                                                        #
-# ------------------------------------------------------------------ #
 class MessageBubble(QFrame):
-    """单条消息气泡"""
+    """Simple read-only chat message bubble."""
+
     def __init__(self, role: str, content: str, parent=None):
         super().__init__(parent)
         self.setFrameShape(QFrame.StyledPanel)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 6, 8, 6)
 
-        # 角色标签
-        role_label = QLabel({"user": "🧑 用户", "assistant": "🤖 Agent",
-                              "tool": "🔧 工具", "thinking": "💭 推理"}.get(role, role))
+        role_label = QLabel({
+            "user": "🧑 用户",
+            "assistant": "🤖 Agent",
+            "tool": "🔧 工具",
+            "thinking": "💭 推理",
+        }.get(role, role))
         role_label.setFont(QFont("Arial", 9, QFont.Bold))
 
-        # 内容
         content_label = QTextEdit()
         content_label.setReadOnly(True)
         content_label.setPlainText(content)
-        content_label.setMaximumHeight(min(200, 40 + content.count('\n') * 20))
+        line_count = max(1, content.count("\n") + 1)
+        content_label.setMaximumHeight(min(240, 38 + line_count * 20))
         content_label.setFrameShape(QFrame.NoFrame)
 
         layout.addWidget(role_label)
         layout.addWidget(content_label)
-
-        # 样式
         colors = {
             "user": "#e8f4fd",
             "assistant": "#f0f7ee",
             "tool": "#fff8e6",
             "thinking": "#f5f0ff",
         }
-        self.setStyleSheet(f"QFrame {{ background: {colors.get(role, '#f5f5f5')}; border-radius: 8px; margin: 2px 0; }}")
+        self.setStyleSheet(
+            f"QFrame {{ background: {colors.get(role, '#f5f5f5')}; "
+            "border-radius: 8px; margin: 2px 0; }}"
+        )
 
 
-# ------------------------------------------------------------------ #
-#  主面板                                                              #
-# ------------------------------------------------------------------ #
 class QGISAgentPanel(QDockWidget):
-    """QGIS Agent 主停靠面板"""
+    """QGIS Agent main dock widget."""
 
     def __init__(self, iface, agent: QGISAgent):
         super().__init__("🌍 QGIS Agent", iface.mainWindow())
@@ -91,13 +149,10 @@ class QGISAgentPanel(QDockWidget):
         self.agent = agent
         self.thread = None
         self.worker = None
-
+        self._last_logged_run_path = None
         self._build_ui()
         self._connect_signals()
 
-    # ------------------------------------------------------------------ #
-    #  UI 构建                                                             #
-    # ------------------------------------------------------------------ #
     def _build_ui(self):
         main_widget = QWidget()
         self.setWidget(main_widget)
@@ -105,7 +160,6 @@ class QGISAgentPanel(QDockWidget):
         root.setContentsMargins(6, 6, 6, 6)
         root.setSpacing(4)
 
-        # 顶部工具栏
         toolbar = QHBoxLayout()
         self.btn_settings = QPushButton("⚙ 设置")
         self.btn_settings.setMaximumWidth(70)
@@ -119,15 +173,12 @@ class QGISAgentPanel(QDockWidget):
         toolbar.addWidget(self.lbl_status)
         root.addLayout(toolbar)
 
-        # 选项卡：对话 / 日志
         self.tabs = QTabWidget()
         root.addWidget(self.tabs, 1)
 
-        # --- 对话标签 ---
         chat_widget = QWidget()
         chat_layout = QVBoxLayout(chat_widget)
         chat_layout.setContentsMargins(0, 0, 0, 0)
-
         self.chat_scroll = QScrollArea()
         self.chat_scroll.setWidgetResizable(True)
         self.chat_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -138,47 +189,42 @@ class QGISAgentPanel(QDockWidget):
         self.chat_scroll.setWidget(self.chat_container)
         chat_layout.addWidget(self.chat_scroll)
 
-        # 进度条
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)
         self.progress.hide()
         chat_layout.addWidget(self.progress)
-
         self.tabs.addTab(chat_widget, "💬 对话")
 
-        # --- 日志标签 ---
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setFont(QFont("Consolas", 9))
         self.tabs.addTab(self.log_view, "📋 日志")
 
-        # 快捷问题按钮区
         quick_label = QLabel("快捷操作:")
         quick_label.setStyleSheet("color: #888; font-size: 10px;")
         root.addWidget(quick_label)
-
-        quick_btns = QHBoxLayout()
+        quick_buttons = QHBoxLayout()
         for text in ["列出所有图层", "缓冲区分析", "计算面积", "导出报告"]:
-            btn = QPushButton(text)
-            btn.setStyleSheet("font-size: 10px; padding: 3px 6px;")
-            btn.clicked.connect(lambda checked, t=text: self._set_input(t))
-            quick_btns.addWidget(btn)
-        root.addLayout(quick_btns)
+            button = QPushButton(text)
+            button.setStyleSheet("font-size: 10px; padding: 3px 6px;")
+            button.clicked.connect(lambda checked=False, value=text: self._set_input(value))
+            quick_buttons.addWidget(button)
+        root.addLayout(quick_buttons)
 
-        # 输入区
         input_row = QHBoxLayout()
         self.input_box = QLineEdit()
-        self.input_box.setPlaceholderText("输入您的地理分析需求，按Enter发送...")
+        self.input_box.setPlaceholderText("输入地理分析需求，按 Enter 发送...")
         self.input_box.setMinimumHeight(36)
         self.btn_send = QPushButton("发送 ▶")
         self.btn_send.setMinimumHeight(36)
         self.btn_send.setMinimumWidth(70)
-        self.btn_send.setStyleSheet("background: #2c5f2e; color: white; border-radius: 4px; font-weight: bold;")
+        self.btn_send.setStyleSheet(
+            "background: #2c5f2e; color: white; border-radius: 4px; font-weight: bold;"
+        )
         input_row.addWidget(self.input_box)
         input_row.addWidget(self.btn_send)
         root.addLayout(input_row)
-
-        self.setMinimumWidth(360)
+        self.setMinimumWidth(380)
 
     def _connect_signals(self):
         self.btn_send.clicked.connect(self._on_send)
@@ -186,49 +232,49 @@ class QGISAgentPanel(QDockWidget):
         self.btn_clear.clicked.connect(self._on_clear)
         self.btn_settings.clicked.connect(self._on_settings)
 
-    # ------------------------------------------------------------------ #
-    #  事件处理                                                            #
-    # ------------------------------------------------------------------ #
     def _on_send(self):
         text = self.input_box.text().strip()
         if not text or self.thread is not None:
             return
-
         self.input_box.clear()
         self._add_bubble("user", text)
         self._set_busy(True)
 
-        # 代码执行确认回调
-        self.agent.set_confirm_execute(self._confirm_code_execute)
+        thread = QThread(self)
+        worker = AgentWorker(self.agent, text)
+        worker.moveToThread(thread)
+        self.thread = thread
+        self.worker = worker
 
-        # 启动后台线程
-        self.thread = QThread()
-        self.worker = AgentWorker(self.agent, text)
-        self.worker.moveToThread(self.thread)
-
-        self.thread.started.connect(self.worker.run)
-        self.worker.finished.connect(self._on_agent_finished)
-        self.worker.thinking.connect(self._on_thinking)
-        self.worker.tool_called.connect(self._on_tool_called)
-        self.worker.tool_result.connect(self._on_tool_result)
-        self.worker.error.connect(self._on_agent_error)
-        self.worker.finished.connect(self.thread.quit)
-        self.worker.error.connect(self.thread.quit)
-        self.thread.finished.connect(self._on_thread_done)
-
-        self.thread.start()
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_agent_finished)
+        worker.thinking.connect(self._on_thinking)
+        worker.tool_called.connect(self._on_tool_called)
+        worker.tool_result.connect(self._on_tool_result)
+        worker.error.connect(self._on_agent_error)
+        worker.execute_requested.connect(self._execute_tool_request)
+        worker.confirm_requested.connect(self._confirm_request)
+        worker.finished.connect(thread.quit)
+        worker.error.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._on_thread_done)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
 
     def _on_agent_finished(self, response: str):
         self._add_bubble("assistant", response)
+        self._log_last_run_path()
         self._set_busy(False)
 
     def _on_agent_error(self, error: str):
         self._add_bubble("assistant", f"❌ {error}")
+        self._log(f"[错误] {error}")
+        self._log_last_run_path()
         self._set_busy(False)
 
-    def _on_thinking(self, msg: str):
-        self.lbl_status.setText(msg)
-        self._log(f"[思考] {msg}")
+    def _on_thinking(self, message: str):
+        self.lbl_status.setText(message)
+        self._log(f"[思考] {message}")
 
     def _on_tool_called(self, name: str, args: str):
         self._add_bubble("tool", f"调用工具: {name}\n参数: {args}")
@@ -240,6 +286,31 @@ class QGISAgentPanel(QDockWidget):
         self._add_bubble("tool", f"工具结果: {name}\n{short}")
         self._log(f"[工具结果] {name}:\n{result}")
 
+    def _execute_tool_request(self, request: MainThreadRequest):
+        try:
+            if request.cancelled:
+                request.error = TimeoutError("工具请求在执行前已超时取消")
+                return
+            fn = request.payload["fn"]
+            args = request.payload["args"]
+            request.result = fn(**args)
+        except Exception as exc:
+            request.error = exc
+        finally:
+            request.done.set()
+
+    def _confirm_request(self, request: MainThreadRequest):
+        try:
+            if request.cancelled:
+                request.result = False
+                return
+            request.result = self._confirm_code_execute(str(request.payload.get("code", "")))
+        except Exception as exc:
+            request.error = exc
+            request.result = False
+        finally:
+            request.done.set()
+
     def _on_thread_done(self):
         self.thread = None
         self.worker = None
@@ -247,54 +318,66 @@ class QGISAgentPanel(QDockWidget):
         self._set_busy(False)
 
     def _on_clear(self):
+        if self.thread is not None:
+            QMessageBox.information(self, "任务执行中", "请等待当前任务结束后再清空对话。")
+            return
         self.agent.clear_history()
-        for i in reversed(range(self.chat_vbox.count())):
-            w = self.chat_vbox.itemAt(i).widget()
-            if w:
-                w.deleteLater()
+        for index in reversed(range(self.chat_vbox.count())):
+            widget = self.chat_vbox.itemAt(index).widget()
+            if widget:
+                widget.deleteLater()
         self.log_view.clear()
         self._log("对话历史已清空")
 
     def _on_settings(self):
-        dlg = SettingsDialog(self.agent.config, self)
-        dlg.exec_()
-        # 重新加载LLM客户端（配置可能已变更）
-        from ..core.llm_client import LLMClient
-        self.agent.llm = LLMClient(self.agent.config)
+        if self.thread is not None:
+            QMessageBox.information(self, "任务执行中", "请等待当前任务结束后再修改设置。")
+            return
+        dialog = SettingsDialog(self.agent.config, self)
+        if dialog.exec_():
+            from ..core.llm_client import LLMClient
+            self.agent.llm = LLMClient(self.agent.config)
+            self.agent.refresh_tool_policy()
 
     def _set_input(self, text: str):
         self.input_box.setText(text)
         self.input_box.setFocus()
 
     def _confirm_code_execute(self, code: str) -> bool:
-        """弹窗确认是否执行代码"""
-        msg = QMessageBox(self)
-        msg.setWindowTitle("确认执行代码")
-        msg.setText("Agent 将执行以下 Python 代码：")
-        msg.setDetailedText(code)
-        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-        msg.setDefaultButton(QMessageBox.Yes)
-        return msg.exec_() == QMessageBox.Yes
+        message = QMessageBox(self)
+        message.setWindowTitle("确认执行 Python 代码")
+        message.setIcon(QMessageBox.Warning)
+        message.setText("Agent 请求执行自定义 Python 代码。代码拥有当前 QGIS 用户的全部权限。")
+        message.setInformativeText("仅在你理解并信任下列代码时选择“是”。")
+        message.setDetailedText(code)
+        message.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        message.setDefaultButton(QMessageBox.No)
+        return message.exec_() == QMessageBox.Yes
 
-    # ------------------------------------------------------------------ #
-    #  UI 辅助                                                             #
-    # ------------------------------------------------------------------ #
     def _add_bubble(self, role: str, content: str):
         bubble = MessageBubble(role, content, self.chat_container)
         self.chat_vbox.addWidget(bubble)
-        # 滚动到底部
-        from qgis.PyQt.QtCore import QTimer
-        QTimer.singleShot(50, lambda: self.chat_scroll.verticalScrollBar().setValue(
-            self.chat_scroll.verticalScrollBar().maximum()))
+        QTimer.singleShot(
+            50,
+            lambda: self.chat_scroll.verticalScrollBar().setValue(
+                self.chat_scroll.verticalScrollBar().maximum()
+            ),
+        )
 
     def _set_busy(self, busy: bool):
         self.btn_send.setEnabled(not busy)
         self.input_box.setEnabled(not busy)
-        if busy:
-            self.progress.show()
-        else:
-            self.progress.hide()
+        self.btn_settings.setEnabled(not busy)
+        self.btn_clear.setEnabled(not busy)
+        self.progress.setVisible(busy)
+        if not busy:
             self.lbl_status.setText("就绪")
 
-    def _log(self, msg: str):
-        self.log_view.appendPlainText(msg)
+    def _log_last_run_path(self):
+        path = self.agent.last_run_log_path
+        if path and path != self._last_logged_run_path:
+            self._log(f"[任务日志] {path}")
+            self._last_logged_run_path = path
+
+    def _log(self, message: str):
+        self.log_view.appendPlainText(message)

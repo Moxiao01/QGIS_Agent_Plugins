@@ -1,0 +1,119 @@
+{
+  "version": 1,
+  "description": "QGIS Agent baseline task and failure cases",
+  "cases": [
+    {
+      "id": "buffer_geographic_reproject_retry",
+      "category": "complete_task",
+      "user_input": "将 areas 图层按 500 米缓冲，保存为 areas_buffer.gpkg。",
+      "preconditions": {
+        "layer": "areas",
+        "layer_type": "polygon",
+        "crs": "EPSG:4326"
+      },
+      "expected_sequence": [
+        {
+          "tool": "get_layer_info",
+          "expected_success": true
+        },
+        {
+          "tool": "buffer",
+          "expected_success": false,
+          "error_code": "GEOGRAPHIC_CRS_DISTANCE"
+        },
+        {
+          "tool": "reproject",
+          "expected_success": true
+        },
+        {
+          "tool": "buffer",
+          "expected_success": true
+        }
+      ],
+      "acceptance": {
+        "output_under_configured_root": true,
+        "output_exists": true,
+        "output_layer_type": "vector",
+        "minimum_feature_count": 1,
+        "final_response_mentions_output": true
+      }
+    },
+    {
+      "id": "duplicate_layer_name",
+      "category": "exception",
+      "user_input": "计算 roads 图层的缓冲区。",
+      "preconditions": {
+        "duplicate_layer_names": [
+          "roads",
+          "roads"
+        ]
+      },
+      "expected_error_contains": "请使用图层 ID",
+      "recovery": "调用 list_layers 并使用唯一 layer_id"
+    },
+    {
+      "id": "output_path_escape",
+      "category": "exception",
+      "user_input": "将结果保存到输出目录外。",
+      "preconditions": {
+        "restrict_output_paths": true
+      },
+      "expected_exception": "ValueError",
+      "expected_error_contains": "输出路径超出允许目录"
+    },
+    {
+      "id": "output_overwrite_denied",
+      "category": "exception",
+      "preconditions": {
+        "allow_overwrite": false,
+        "output_exists": true
+      },
+      "expected_exception": "FileExistsError",
+      "expected_error_contains": "默认拒绝覆盖"
+    },
+    {
+      "id": "processing_algorithm_not_allowed",
+      "category": "security",
+      "preconditions": {
+        "enable_generic_processing": true,
+        "allowlist": [
+          "native:buffer"
+        ]
+      },
+      "tool_call": {
+        "tool": "run_processing_algorithm",
+        "algorithm": "gdal:rasterize"
+      },
+      "expected_error_code": "PROCESSING_ALGORITHM_NOT_ALLOWED"
+    },
+    {
+      "id": "python_execution_not_authorized",
+      "category": "security",
+      "preconditions": {
+        "enable_python_tool": true,
+        "enable_auto_execute": false,
+        "user_confirms": false
+      },
+      "tool_call": {
+        "tool": "execute_python",
+        "code": "print('test')"
+      },
+      "expected_success": false,
+      "expected_error_contains": "用户未授权"
+    },
+    {
+      "id": "llm_rate_limit_retry",
+      "category": "transport",
+      "preconditions": {
+        "request_retries": 2,
+        "responses": [
+          429,
+          503,
+          200
+        ]
+      },
+      "expected_attempts": 3,
+      "expected_success": true
+    }
+  ]
+}
